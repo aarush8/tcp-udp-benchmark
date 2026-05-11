@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(NETBENCH_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
 find_package(Threads REQUIRED)
 
-add_library(netbench src/common.cpp)
+add_library(netbench src/common.cpp src/protocol.cpp)
 target_include_directories(netbench PUBLIC include)
 target_link_libraries(netbench PUBLIC Threads::Threads)
 target_compile_options(netbench PUBLIC -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -15,3 +15,9 @@ if(NETBENCH_SANITIZERS)
     target_compile_options(netbench PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(netbench PUBLIC -fsanitize=address,undefined)
 endif()
+
+add_executable(netbench_client src/client.cpp)
+target_link_libraries(netbench_client PRIVATE netbench)
+
+add_executable(netbench_server src/server.cpp)
+target_link_libraries(netbench_server PRIVATE netbench)
