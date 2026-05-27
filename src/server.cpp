@@ -12,8 +12,7 @@ int main(int argc, char **argv) {
     try {
         install_signals();
         const auto config = parse(argc, argv, true);
-        if (config.protocol != "tcp")
-            throw Error("UDP is not available in this version");
+
         const auto end = now_ns() + static_cast<uint64_t>(config.duration * 1e9);
         auto socket = make_socket(config, true);
         bind_socket(socket.get(), config);
@@ -55,6 +54,20 @@ int main(int argc, char **argv) {
                         break;
                     }
                 }
+            } else {
+                std::array<uint8_t, header_size + udp_chunk> packet{};
+                sockaddr_in peer{};
+                socklen_t length = sizeof(peer);
+                const auto deadline = now_ns() + config.timeout_ms * uint64_t{1000000};
+                const auto size =
+                    recv_datagram(socket.get(), packet.data(), packet.size(), deadline,
+                                  reinterpret_cast<sockaddr *>(&peer), &length);
+                const auto header = decode(std::span(packet.data(), size), true);
+                if (size != header_size + fragment_size(header))
+                    throw Error("invalid UDP fragment size");
+                send_datagram(socket.get(), packet.data(), size, deadline,
+                              reinterpret_cast<sockaddr *>(&peer), length);
+                ++frames;
             }
         }
         std::cout << "{\"event\":\"summary\",\"frames_echoed\":" << frames << "}\n";
