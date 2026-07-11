@@ -1,0 +1,11 @@
+{
+  "build": "/home/aarush/Work/net_benchmark/build",
+  "output": "results/baseline",
+  "profile": "baseline",
+  "repeats": 3,
+  "duration": 0.5,
+  "rate": 10000,
+  "mbps": 100,
+  "seed": 20261115,
+  "warmups": 1
+}
