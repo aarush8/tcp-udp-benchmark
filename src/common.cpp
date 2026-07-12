@@ -85,6 +85,7 @@ Config parse(int argc, char **argv, bool server) {
                    "--mbps aggregate request payload cap (0.01..1000) --timeout-ms 10..5000\n"
                    "--sndbuf bytes --rcvbuf bytes (0=system default, max 16777216)\n"
                    "--io blocking|nonblocking --nodelay 0|1 --format json|csv\n"
+                   "--write split|coalesced\n"
                    "Stop at the first duration/message limit. Server port 0 chooses a free port.\n";
             std::exit(0);
         }
@@ -99,6 +100,8 @@ Config parse(int argc, char **argv, bool server) {
             c.io = v;
         else if (k == "--format")
             c.format = v;
+        else if (k == "--write")
+            c.write = v;
         else if (k == "--port") {
             auto p = number(v);
             if (p > 65535)
@@ -135,7 +138,8 @@ Config parse(int argc, char **argv, bool server) {
     if (inet_pton(AF_INET, c.host.c_str(), &addr) != 1)
         throw Error("host must be a numeric IPv4 address");
     if ((c.protocol != "tcp" && c.protocol != "udp") ||
-        (c.io != "blocking" && c.io != "nonblocking") || (c.format != "json" && c.format != "csv"))
+        (c.io != "blocking" && c.io != "nonblocking") ||
+        (c.format != "json" && c.format != "csv") || (c.write != "split" && c.write != "coalesced"))
         throw Error("invalid protocol, io, or format");
     if (c.payload < 64 || c.payload > 1048576 || c.messages < 1 || c.messages > 1000000 ||
         c.clients < 1 || c.clients > 32 ||

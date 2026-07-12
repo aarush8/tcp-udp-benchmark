@@ -41,9 +41,16 @@ void run(const Config &c, Stats &s, std::barrier<> &ready, uint64_t &start) {
                 if (c.protocol == "tcp") {
                     auto header = encode({c.payload, seq, 0, 1});
                     std::vector<uint8_t> payload(pattern), echo(header_size + c.payload);
-                    // Baseline deliberately uses two writes. Coalescing is evaluated later.
-                    send_all(sock.get(), header.data(), header.size(), deadline);
-                    send_all(sock.get(), payload.data(), payload.size(), deadline);
+                    // Select the write strategy while preserving the same frame format.
+                    if (c.write == "coalesced") {
+                        std::vector<uint8_t> frame(header_size + payload.size());
+                        std::copy(header.begin(), header.end(), frame.begin());
+                        std::copy(payload.begin(), payload.end(), frame.begin() + header_size);
+                        send_all(sock.get(), frame.data(), frame.size(), deadline);
+                    } else {
+                        send_all(sock.get(), header.data(), header.size(), deadline);
+                        send_all(sock.get(), payload.data(), payload.size(), deadline);
+                    }
                     recv_exact(sock.get(), echo.data(), echo.size(), deadline);
                     auto h = decode(echo, false);
                     if (h.payload != c.payload || h.sequence != seq ||

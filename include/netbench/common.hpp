@@ -36,6 +36,7 @@ uint64_t now_ns();
 double cpu_seconds();
 struct Config {
     std::string protocol = "tcp", host = "127.0.0.1", io = "blocking", format = "json";
+    std::string write = "split";
     uint32_t payload = 1024, messages = 1000, clients = 1, iterations = 1;
     uint32_t timeout_ms = 500, sndbuf = 0, rcvbuf = 0, rate = 10000;
     uint16_t port = 9000;
