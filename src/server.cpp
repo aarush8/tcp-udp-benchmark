@@ -15,6 +15,7 @@ struct Worker {
 void serve_tcp(Fd fd, const Config &c, std::atomic<uint64_t> &frames,
                std::atomic<uint64_t> &errors) {
     try {
+        std::vector<uint8_t> frame;
         while (!stopped) {
             uint64_t deadline = now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000;
             std::array<uint8_t, header_size> header{};
@@ -23,7 +24,10 @@ void serve_tcp(Fd fd, const Config &c, std::atomic<uint64_t> &frames,
             deadline = now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000;
             recv_exact(fd.get(), header.data() + 1, header.size() - 1, deadline);
             auto h = decode(header, false);
-            std::vector<uint8_t> frame(header_size + h.payload);
+            if (c.buffering == "allocate")
+                frame = std::vector<uint8_t>(header_size + h.payload);
+            else
+                frame.resize(header_size + h.payload);
             std::copy(header.begin(), header.end(), frame.begin());
             recv_exact(fd.get(), frame.data() + header_size, h.payload, deadline);
             send_all(fd.get(), frame.data(), frame.size(), deadline);

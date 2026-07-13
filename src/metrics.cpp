@@ -92,10 +92,21 @@ std::string result_json(const Config &c, uint32_t it, const std::vector<Stats> &
     o << "]}";
     return o.str();
 }
+static std::string csv_quote(const std::string &s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '\"')
+            out += '\"';
+        out += c;
+    }
+    return out + '\"';
+}
 std::string csv_header() {
     return "iteration,protocol,payload,clients,io,nodelay,elapsed_s,client_cpu_percent,attempted_"
            "messages,completed_messages,goodput_mbps,rtt_mean_us,rtt_median_us,rtt_p95_us,rtt_p99_"
-           "us,datagrams_sent,unique_echo_datagrams,timeouts,errors";
+           "us,datagrams_sent,unique_echo_datagrams,timeouts,errors,write,buffering,status,udp_"
+           "echo_loss_percent,missing_messages,duplicates,reordered,late_or_stale,config_json,"
+           "record_json";
 }
 std::string result_csv(const Config &c, uint32_t it, const std::vector<Stats> &stats, double sec,
                        double cpu) {
@@ -111,7 +122,18 @@ std::string result_csv(const Config &c, uint32_t it, const std::vector<Stats> &s
     else
         o << ",,,";
     o << ',' << s.datagrams_sent << ',' << s.datagrams_received << ',' << s.timeouts << ','
-      << s.errors;
+      << s.errors << ',' << c.write << ',' << c.buffering << ','
+      << (stopped      ? "interrupted"
+          : s.errors   ? "error"
+          : s.timeouts ? "incomplete"
+                       : "ok")
+      << ',';
+    if (c.protocol == "udp" && s.datagrams_sent)
+        o << 100.0 * static_cast<double>(s.datagrams_sent - s.datagrams_received) /
+                 static_cast<double>(s.datagrams_sent);
+    o << ',' << s.attempted - s.completed << ',' << s.duplicates << ',' << s.reordered << ','
+      << s.late << ',' << csv_quote(config_json(c)) << ','
+      << csv_quote(result_json(c, it, stats, sec, cpu));
     return o.str();
 }
 } // namespace nb

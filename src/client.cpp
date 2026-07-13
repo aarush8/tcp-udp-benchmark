@@ -24,13 +24,23 @@ void run(const Config &c, Stats &s, std::barrier<> &ready, uint64_t &start) {
         return;
     try {
         auto pattern = payload_pattern(c.payload);
+        std::vector<uint8_t> reusable_send, reusable_echo;
+        if (c.buffering == "reuse") {
+            reusable_send.resize(header_size + c.payload);
+            reusable_echo.resize(header_size + c.payload);
+            std::copy(pattern.begin(), pattern.end(), reusable_send.begin() + header_size);
+        }
         uint64_t end = start + static_cast<uint64_t>(c.duration * 1e9);
         double per_second = std::min(static_cast<double>(c.rate) / c.clients,
                                      c.mbps * 1e6 / 8 / c.payload / c.clients);
         uint64_t interval = static_cast<uint64_t>(1e9 / per_second), next = start;
         for (uint64_t seq = 0; seq < c.messages && !stopped; ++seq) {
-            if (now_ns() >= end || next >= end)
+            if (now_ns() >= end)
                 break;
+            if (next >= end) {
+                pace_until(end);
+                break;
+            }
             pace_until(next);
             if (stopped || now_ns() >= end)
                 break;
@@ -40,27 +50,37 @@ void run(const Config &c, Stats &s, std::barrier<> &ready, uint64_t &start) {
             try {
                 if (c.protocol == "tcp") {
                     auto header = encode({c.payload, seq, 0, 1});
-                    std::vector<uint8_t> payload(pattern), echo(header_size + c.payload);
-                    // Select the write strategy while preserving the same frame format.
-                    if (c.write == "coalesced") {
-                        std::vector<uint8_t> frame(header_size + payload.size());
-                        std::copy(header.begin(), header.end(), frame.begin());
-                        std::copy(payload.begin(), payload.end(), frame.begin() + header_size);
-                        send_all(sock.get(), frame.data(), frame.size(), deadline);
-                    } else {
-                        send_all(sock.get(), header.data(), header.size(), deadline);
-                        send_all(sock.get(), payload.data(), payload.size(), deadline);
+                    std::vector<uint8_t> allocated_send, allocated_echo;
+                    if (c.buffering == "allocate") {
+                        allocated_send.resize(header_size + c.payload);
+                        allocated_echo.resize(header_size + c.payload);
+                        std::copy(pattern.begin(), pattern.end(),
+                                  allocated_send.begin() + header_size);
+                    }
+                    auto &packet = c.buffering == "reuse" ? reusable_send : allocated_send;
+                    auto &echo = c.buffering == "reuse" ? reusable_echo : allocated_echo;
+                    std::copy(header.begin(), header.end(), packet.begin());
+                    if (c.write == "coalesced")
+                        send_all(sock.get(), packet.data(), packet.size(), deadline);
+                    else {
+                        send_all(sock.get(), packet.data(), header_size, deadline);
+                        send_all(sock.get(), packet.data() + header_size, c.payload, deadline);
                     }
                     recv_exact(sock.get(), echo.data(), echo.size(), deadline);
                     auto h = decode(echo, false);
                     if (h.payload != c.payload || h.sequence != seq ||
-                        !std::equal(payload.begin(), payload.end(), echo.begin() + header_size))
+                        !std::equal(pattern.begin(), pattern.end(), echo.begin() + header_size))
                         throw Error("TCP echo integrity mismatch");
                 } else {
                     uint32_t fragments = fragment_count(c.payload);
                     SequenceTracker tracker(fragments);
-                    std::vector<uint8_t> packet(header_size + udp_chunk),
-                        echo(header_size + udp_chunk);
+                    std::vector<uint8_t> allocated_send, allocated_echo;
+                    if (c.buffering == "allocate") {
+                        allocated_send.resize(header_size + udp_chunk);
+                        allocated_echo.resize(header_size + udp_chunk);
+                    }
+                    auto &packet = c.buffering == "reuse" ? reusable_send : allocated_send;
+                    auto &echo = c.buffering == "reuse" ? reusable_echo : allocated_echo;
                     for (uint32_t f = 0; f < fragments; ++f) {
                         Header h{c.payload, seq, f, fragments};
                         auto header = encode(h);

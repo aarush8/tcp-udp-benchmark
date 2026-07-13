@@ -85,7 +85,7 @@ Config parse(int argc, char **argv, bool server) {
                    "--mbps aggregate request payload cap (0.01..1000) --timeout-ms 10..5000\n"
                    "--sndbuf bytes --rcvbuf bytes (0=system default, max 16777216)\n"
                    "--io blocking|nonblocking --nodelay 0|1 --format json|csv\n"
-                   "--write split|coalesced\n"
+                   "--write split|coalesced --buffering allocate|reuse\n"
                    "Stop at the first duration/message limit. Server port 0 chooses a free port.\n";
             std::exit(0);
         }
@@ -102,6 +102,8 @@ Config parse(int argc, char **argv, bool server) {
             c.format = v;
         else if (k == "--write")
             c.write = v;
+        else if (k == "--buffering")
+            c.buffering = v;
         else if (k == "--port") {
             auto p = number(v);
             if (p > 65535)
@@ -139,8 +141,10 @@ Config parse(int argc, char **argv, bool server) {
         throw Error("host must be a numeric IPv4 address");
     if ((c.protocol != "tcp" && c.protocol != "udp") ||
         (c.io != "blocking" && c.io != "nonblocking") ||
-        (c.format != "json" && c.format != "csv") || (c.write != "split" && c.write != "coalesced"))
-        throw Error("invalid protocol, io, or format");
+        (c.format != "json" && c.format != "csv") ||
+        (c.write != "split" && c.write != "coalesced") ||
+        (c.buffering != "allocate" && c.buffering != "reuse"))
+        throw Error("invalid protocol, io, format, write, or buffering");
     if (c.payload < 64 || c.payload > 1048576 || c.messages < 1 || c.messages > 1000000 ||
         c.clients < 1 || c.clients > 32 ||
         static_cast<uint64_t>(c.clients) * c.messages > 1000000 || c.iterations < 1 ||
@@ -160,7 +164,8 @@ std::string config_json(const Config &c) {
            ",\"mbps\":" + std::to_string(c.mbps) +
            ",\"timeout_ms\":" + std::to_string(c.timeout_ms) +
            ",\"sndbuf\":" + std::to_string(c.sndbuf) + ",\"rcvbuf\":" + std::to_string(c.rcvbuf) +
-           ",\"io\":\"" + c.io + "\",\"nodelay\":" + (c.nodelay ? "true" : "false") + "}";
+           ",\"io\":\"" + c.io + "\",\"write\":\"" + c.write + "\",\"buffering\":\"" + c.buffering +
+           "\",\"nodelay\":" + (c.nodelay ? "true" : "false") + "}";
 }
 static sockaddr_in address(const Config &c) {
     sockaddr_in a{};
