@@ -1,0 +1,32 @@
+{
+  "command": [
+    "strace",
+    "-f",
+    "-tt",
+    "-T",
+    "-e",
+    "trace=sendto,recvfrom,poll",
+    "-o",
+    "results/diagnostics/split.strace",
+    "build/netbench_client",
+    "--port",
+    "44185",
+    "--write",
+    "split",
+    "--payload",
+    "64",
+    "--messages",
+    "8",
+    "--duration",
+    "1",
+    "--rate",
+    "10000",
+    "--nodelay",
+    "0",
+    "--buffering",
+    "allocate"
+  ],
+  "returncode": 0,
+  "stdout": "{\"schema_version\":1,\"iteration\":0,\"config\":{\"protocol\":\"tcp\",\"host\":\"127.0.0.1\",\"port\":44185,\"payload\":64,\"messages\":8,\"clients\":1,\"iterations\":1,\"duration\":1.000000,\"rate\":10000,\"mbps\":100.000000,\"timeout_ms\":500,\"sndbuf\":0,\"rcvbuf\":0,\"io\":\"blocking\",\"write\":\"split\",\"buffering\":\"allocate\",\"nodelay\":false},\"status\":\"ok\",\"elapsed_s\":0.288159813,\"client_cpu_s\":0.000744,\"client_cpu_percent\":0.258190062054,\"attempted_messages\":8,\"completed_messages\":8,\"goodput_mbps\":0.0142143345991,\"rtt_samples\":8,\"rtt_mean_us\":35976.92825,\"rtt_median_us\":40995.411,\"rtt_p95_us\":41540.554,\"rtt_p99_us\":41540.554,\"datagrams_sent\":0,\"unique_echo_datagrams\":0,\"udp_echo_loss_percent\":null,\"missing_messages\":0,\"duplicates\":0,\"reordered\":0,\"late_or_stale\":0,\"timeouts\":0,\"errors\":0,\"connections\":[{\"sndbuf_effective\":2626560,\"rcvbuf_effective\":131072,\"error\":\"\"}]}\n",
+  "stderr": ""
+}

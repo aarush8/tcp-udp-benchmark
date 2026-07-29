@@ -1,0 +1,11 @@
+{
+  "build": "/home/aarush/Work/net_benchmark/build",
+  "output": "results/confirmation",
+  "profile": "confirmation",
+  "repeats": 5,
+  "duration": 3.0,
+  "rate": 10000,
+  "mbps": 100,
+  "seed": 20261115,
+  "warmups": 1
+}

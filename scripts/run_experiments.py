@@ -61,6 +61,13 @@ def matrix(profile):
     elif profile == 'comparison':
         for size, nodelay, write, buffering in itertools.product((64, 65536, 1048576), (0, 1), ('split', 'coalesced'), ('allocate', 'reuse')):
             add('optimization', payload=size, nodelay=nodelay, write=write, buffering=buffering)
+    elif profile == 'confirmation':
+        for nodelay, write in itertools.product((0, 1), ('split', 'coalesced')):
+            add('confirm_small', payload=64, nodelay=nodelay, write=write, buffering='allocate')
+        for buffering in ('allocate', 'reuse'):
+            add('confirm_large', payload=1048576, nodelay=1, write='coalesced', buffering=buffering)
+        for size in (64, 1048576):
+            add('confirm_udp', protocol='udp', payload=size, write='coalesced', buffering='reuse')
     elif profile == 'survey':
         base |= dict(write='coalesced', buffering='reuse')
         for proto, size in itertools.product(('tcp', 'udp'), (64, 1024, 16384, 65536, 1048576)):
@@ -123,7 +130,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--build', type=Path, default=ROOT/'build')
     ap.add_argument('--output', type=Path, required=True)
-    ap.add_argument('--profile', choices=['baseline'], default='baseline')
+    ap.add_argument('--profile', choices=['baseline', 'comparison', 'survey', 'confirmation'], default='baseline')
     ap.add_argument('--repeats', type=int, default=5)
     ap.add_argument('--duration', type=float, default=.5)
     ap.add_argument('--rate', type=int, default=10000)

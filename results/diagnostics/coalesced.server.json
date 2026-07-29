@@ -1,0 +1,12 @@
+{
+  "command": [
+    "build/netbench_server",
+    "--port",
+    "0",
+    "--duration",
+    "5"
+  ],
+  "stdout": "{\"event\":\"summary\",\"frames_echoed\":8,\"errors\":0,\"accepted_connections\":1,\"rejected_connections\":0,\"cpu_s\":0.000511,\"lifetime_s\":0.00903707}\n",
+  "stderr": "",
+  "returncode": 0
+}
