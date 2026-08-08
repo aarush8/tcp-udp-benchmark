@@ -49,6 +49,16 @@ struct Summary {
         }
     }
 };
+static const char *result_status(const Stats &stats) {
+    if (stopped)
+        return "interrupted";
+    if (stats.errors)
+        return "error";
+    if (stats.timeouts)
+        return "incomplete";
+    return stats.completed ? "ok" : "no_samples";
+}
+
 std::string result_json(const Config &c, uint32_t it, const std::vector<Stats> &stats, double sec,
                         double cpu) {
     Summary a(stats);
@@ -56,12 +66,7 @@ std::string result_json(const Config &c, uint32_t it, const std::vector<Stats> &
     std::ostringstream o;
     o << std::setprecision(12);
     o << "{\"schema_version\":1,\"iteration\":" << it << ",\"config\":" << config_json(c)
-      << ",\"status\":\""
-      << (stopped      ? "interrupted"
-          : s.errors   ? "error"
-          : s.timeouts ? "incomplete"
-                       : "ok")
-      << "\""
+      << ",\"status\":\"" << result_status(s) << "\""
       << ",\"elapsed_s\":" << sec << ",\"client_cpu_s\":" << cpu
       << ",\"client_cpu_percent\":" << 100 * cpu / sec << ",\"attempted_messages\":" << s.attempted
       << ",\"completed_messages\":" << s.completed
@@ -92,6 +97,7 @@ std::string result_json(const Config &c, uint32_t it, const std::vector<Stats> &
     o << "]}";
     return o.str();
 }
+
 static std::string csv_quote(const std::string &s) {
     std::string out = "\"";
     for (char c : s) {
@@ -101,6 +107,7 @@ static std::string csv_quote(const std::string &s) {
     }
     return out + '\"';
 }
+
 std::string csv_header() {
     return "iteration,protocol,payload,clients,io,nodelay,elapsed_s,client_cpu_percent,attempted_"
            "messages,completed_messages,goodput_mbps,rtt_mean_us,rtt_median_us,rtt_p95_us,rtt_p99_"
@@ -108,6 +115,7 @@ std::string csv_header() {
            "echo_loss_percent,missing_messages,duplicates,reordered,late_or_stale,config_json,"
            "record_json";
 }
+
 std::string result_csv(const Config &c, uint32_t it, const std::vector<Stats> &stats, double sec,
                        double cpu) {
     Summary a(stats);
@@ -122,12 +130,7 @@ std::string result_csv(const Config &c, uint32_t it, const std::vector<Stats> &s
     else
         o << ",,,";
     o << ',' << s.datagrams_sent << ',' << s.datagrams_received << ',' << s.timeouts << ','
-      << s.errors << ',' << c.write << ',' << c.buffering << ','
-      << (stopped      ? "interrupted"
-          : s.errors   ? "error"
-          : s.timeouts ? "incomplete"
-                       : "ok")
-      << ',';
+      << s.errors << ',' << c.write << ',' << c.buffering << ',' << result_status(s) << ',';
     if (c.protocol == "udp" && s.datagrams_sent)
         o << 100.0 * static_cast<double>(s.datagrams_sent - s.datagrams_received) /
                  static_cast<double>(s.datagrams_sent);

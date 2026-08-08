@@ -1,4 +1,5 @@
 #include "netbench/common.hpp"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <charconv>
@@ -17,6 +18,7 @@ std::atomic<bool> stopped{false};
 static void stop_handler(int) {
     stopped = 1;
 }
+
 void install_signals() {
     struct sigaction a{};
     a.sa_handler = stop_handler;
@@ -24,14 +26,17 @@ void install_signals() {
     syscheck(sigaction(SIGINT, &a, nullptr) == 0, "sigaction");
     syscheck(sigaction(SIGTERM, &a, nullptr) == 0, "sigaction");
 }
+
 void syscheck(bool ok, const char *op) {
     if (!ok)
         throw Error(std::string(op) + ": " + std::strerror(errno));
 }
+
 Fd::~Fd() {
     if (fd_ >= 0)
         ::close(fd_);
 }
+
 Fd::Fd(Fd &&o) noexcept : fd_(std::exchange(o.fd_, -1)) {}
 Fd &Fd::operator=(Fd &&o) noexcept {
     if (this != &o) {
@@ -41,17 +46,20 @@ Fd &Fd::operator=(Fd &&o) noexcept {
     }
     return *this;
 }
+
 uint64_t now_ns() {
     timespec t{};
     syscheck(clock_gettime(CLOCK_MONOTONIC_RAW, &t) == 0, "clock_gettime");
     return static_cast<uint64_t>(t.tv_sec) * 1000000000ULL + static_cast<uint64_t>(t.tv_nsec);
 }
+
 double cpu_seconds() {
     rusage r{};
     syscheck(getrusage(RUSAGE_SELF, &r) == 0, "getrusage");
     return static_cast<double>(r.ru_utime.tv_sec + r.ru_stime.tv_sec) +
            static_cast<double>(r.ru_utime.tv_usec + r.ru_stime.tv_usec) / 1e6;
 }
+
 static uint32_t number(const std::string &s) {
     uint32_t n{};
     auto [p, e] = std::from_chars(s.data(), s.data() + s.size(), n);
@@ -59,6 +67,7 @@ static uint32_t number(const std::string &s) {
         throw Error("invalid integer: " + s);
     return n;
 }
+
 static double real(const std::string &s) {
     size_t end{};
     double x;
@@ -71,6 +80,7 @@ static double real(const std::string &s) {
         throw Error("invalid number: " + s);
     return x;
 }
+
 Config parse(int argc, char **argv, bool server) {
     Config c;
     if (server)
@@ -154,6 +164,7 @@ Config parse(int argc, char **argv, bool server) {
         throw Error("configuration outside bounded limits");
     return c;
 }
+
 std::string config_json(const Config &c) {
     return "{\"protocol\":\"" + c.protocol + "\",\"host\":\"" + c.host +
            "\",\"port\":" + std::to_string(c.port) + ",\"payload\":" + std::to_string(c.payload) +
@@ -165,8 +176,9 @@ std::string config_json(const Config &c) {
            ",\"timeout_ms\":" + std::to_string(c.timeout_ms) +
            ",\"sndbuf\":" + std::to_string(c.sndbuf) + ",\"rcvbuf\":" + std::to_string(c.rcvbuf) +
            ",\"io\":\"" + c.io + "\",\"write\":\"" + c.write + "\",\"buffering\":\"" + c.buffering +
-           "\",\"nodelay\":" + (c.nodelay ? "true" : "false") + "}";
+           "\",\"format\":\"" + c.format + "\",\"nodelay\":" + (c.nodelay ? "true" : "false") + "}";
 }
+
 static sockaddr_in address(const Config &c) {
     sockaddr_in a{};
     a.sin_family = AF_INET;
@@ -174,6 +186,7 @@ static sockaddr_in address(const Config &c) {
     syscheck(inet_pton(AF_INET, c.host.c_str(), &a.sin_addr) == 1, "inet_pton");
     return a;
 }
+
 void configure(int fd, const Config &c, bool nonblocking) {
     if (c.sndbuf) {
         int n = static_cast<int>(c.sndbuf);
@@ -196,18 +209,21 @@ void configure(int fd, const Config &c, bool nonblocking) {
     syscheck(fcntl(fd, F_SETFL, nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) == 0,
              "F_SETFL");
 }
+
 Fd make_socket(const Config &c, bool nonblocking) {
     Fd fd(socket(AF_INET, (c.protocol == "tcp" ? SOCK_STREAM : SOCK_DGRAM) | SOCK_CLOEXEC, 0));
     syscheck(fd.get() >= 0, "socket");
     configure(fd.get(), c, nonblocking);
     return fd;
 }
+
 void bind_socket(int fd, const Config &c) {
     int yes = 1;
     syscheck(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == 0, "SO_REUSEADDR");
     auto a = address(c);
     syscheck(bind(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) == 0, "bind");
 }
+
 void connect_socket(int fd, const Config &c, uint64_t deadline) {
     int flags = fcntl(fd, F_GETFL, 0);
     syscheck(flags >= 0, "F_GETFL");
@@ -228,24 +244,28 @@ void connect_socket(int fd, const Config &c, uint64_t deadline) {
     }
     syscheck(fcntl(fd, F_SETFL, flags) == 0, "restore socket flags");
 }
+
 uint16_t local_port(int fd) {
     sockaddr_in a{};
     socklen_t n = sizeof(a);
     syscheck(getsockname(fd, reinterpret_cast<sockaddr *>(&a), &n) == 0, "getsockname");
     return ntohs(a.sin_port);
 }
+
 int socket_buffer(int fd, int option) {
     int n{};
     socklen_t len = sizeof(n);
     syscheck(getsockopt(fd, SOL_SOCKET, option, &n, &len) == 0, "getsockopt buffer");
     return n;
 }
+
 static void deadline_check(uint64_t deadline) {
     if (stopped)
         throw Error("interrupted");
     if (now_ns() >= deadline)
         throw Timeout("I/O deadline exceeded");
 }
+
 void wait_ready(int fd, short events, uint64_t deadline) {
     for (;;) {
         deadline_check(deadline);
@@ -268,6 +288,7 @@ void wait_ready(int fd, short events, uint64_t deadline) {
         }
     }
 }
+
 void send_all(int fd, const uint8_t *data, size_t size, uint64_t deadline) {
     size_t pos = 0;
     while (pos < size) {
@@ -285,6 +306,7 @@ void send_all(int fd, const uint8_t *data, size_t size, uint64_t deadline) {
             syscheck(false, "send");
     }
 }
+
 void recv_exact(int fd, uint8_t *data, size_t size, uint64_t deadline) {
     size_t pos = 0;
     while (pos < size) {
@@ -302,6 +324,7 @@ void recv_exact(int fd, uint8_t *data, size_t size, uint64_t deadline) {
             syscheck(false, "recv");
     }
 }
+
 void send_datagram(int fd, const uint8_t *data, size_t size, uint64_t deadline,
                    const sockaddr *peer, socklen_t peerlen) {
     for (;;) {
@@ -320,6 +343,7 @@ void send_datagram(int fd, const uint8_t *data, size_t size, uint64_t deadline,
             syscheck(false, "sendto");
     }
 }
+
 size_t recv_datagram(int fd, uint8_t *data, size_t capacity, uint64_t deadline, sockaddr *peer,
                      socklen_t *peerlen) {
     for (;;) {
@@ -338,6 +362,7 @@ size_t recv_datagram(int fd, uint8_t *data, size_t capacity, uint64_t deadline, 
             syscheck(false, "recvfrom");
     }
 }
+
 void pace_until(uint64_t deadline) {
     while (!stopped) {
         auto now = now_ns();

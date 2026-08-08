@@ -3,6 +3,7 @@
 #include "netbench/protocol.hpp"
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <pthread.h>
 #include <thread>
 #include <unistd.h>
 using namespace nb;
@@ -114,4 +115,72 @@ TEST(Metrics, MissingSamplesAreNull) {
     auto json = result_json(c, 0, {s}, 1, .1);
     EXPECT_NE(json.find("\"rtt_mean_us\":null"), std::string::npos);
     EXPECT_NE(json.find("\"udp_echo_loss_percent\":null"), std::string::npos);
+}
+TEST(Metrics, EmptyRunIsNotSuccessful) {
+    Config config;
+    Stats empty;
+    const auto json = result_json(config, 0, {empty}, 1, .1);
+    EXPECT_NE(json.find("\"status\":\"no_samples\""), std::string::npos);
+    EXPECT_NE(result_csv(config, 0, {empty}, 1, .1).find(",no_samples,"), std::string::npos);
+}
+
+namespace {
+std::atomic<unsigned> interruptions{0};
+void interrupt_wait(int) {
+    interruptions.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+TEST(IO, InterruptedRecvResumesWithoutLosingBytes) {
+    Pair p;
+    struct sigaction action{}, previous{};
+    action.sa_handler = interrupt_wait;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaction(SIGUSR1, &action, &previous), 0);
+    uint8_t value = 0;
+    std::exception_ptr failure;
+    std::thread reader([&] {
+        try {
+            recv_exact(p.b.get(), &value, 1, now_ns() + 1000000000);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(pthread_kill(reader.native_handle(), SIGUSR1), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    uint8_t sent = 91;
+    send_all(p.a.get(), &sent, 1, now_ns() + 1000000000);
+    reader.join();
+    EXPECT_FALSE(failure);
+    EXPECT_EQ(value, sent);
+    EXPECT_GE(interruptions.load(), 1u);
+    EXPECT_EQ(sigaction(SIGUSR1, &previous, nullptr), 0);
+}
+TEST(IO, OversizedUdpDatagramIsRejected) {
+    Config c;
+    c.protocol = "udp";
+    c.port = 0;
+    auto receiver = make_socket(c, true);
+    bind_socket(receiver.get(), c);
+    c.port = local_port(receiver.get());
+    auto sender = make_socket(c, true);
+    connect_socket(sender.get(), c, now_ns() + 1000000000);
+    std::vector<uint8_t> bytes(2048, 42);
+    send_datagram(sender.get(), bytes.data(), bytes.size(), now_ns() + 1000000000);
+    uint8_t small[16];
+    EXPECT_THROW(recv_datagram(receiver.get(), small, sizeof(small), now_ns() + 1000000000), Error);
+}
+TEST(Metrics, NearestRankQuantilesAndCorrectGoodputUnits) {
+    Config c;
+    c.payload = 1000;
+    Stats s;
+    s.rtt_us = {1, 2, 3, 4, 100};
+    s.completed = 5;
+    s.attempted = 5;
+    auto json = result_json(c, 0, {s}, 2, .5);
+    EXPECT_NE(json.find("\"goodput_mbps\":0.02"), std::string::npos);
+    EXPECT_NE(json.find("\"rtt_mean_us\":22"), std::string::npos);
+    EXPECT_NE(json.find("\"rtt_median_us\":3"), std::string::npos);
+    EXPECT_NE(json.find("\"rtt_p95_us\":100"), std::string::npos);
+    EXPECT_NE(json.find("\"client_cpu_percent\":25"), std::string::npos);
 }

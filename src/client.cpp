@@ -5,36 +5,136 @@
 #include <barrier>
 #include <iostream>
 #include <thread>
+
 using namespace nb;
+
 namespace {
-void run(const Config &c, Stats &s, std::barrier<> &ready, uint64_t &start) {
-    Fd sock;
-    try {
-        sock = make_socket(c, c.io == "nonblocking");
-        connect_socket(sock.get(), c, now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000);
-        s.sndbuf = socket_buffer(sock.get(), SO_SNDBUF);
-        s.rcvbuf = socket_buffer(sock.get(), SO_RCVBUF);
-    } catch (const std::exception &e) {
-        ++s.errors;
-        s.error = e.what();
+struct MessageBuffers {
+    std::vector<uint8_t> request;
+    std::vector<uint8_t> response;
+
+    void resize(size_t size) {
+        request.resize(size);
+        response.resize(size);
     }
-    ready.arrive_and_wait(); // Main publishes one common start after all connects finish.
-    ready.arrive_and_wait();
-    if (s.errors)
-        return;
-    try {
-        auto pattern = payload_pattern(c.payload);
-        std::vector<uint8_t> reusable_send, reusable_echo;
-        if (c.buffering == "reuse") {
-            reusable_send.resize(header_size + c.payload);
-            reusable_echo.resize(header_size + c.payload);
-            std::copy(pattern.begin(), pattern.end(), reusable_send.begin() + header_size);
+};
+
+struct MessageTiming {
+    uint64_t start;
+    uint64_t deadline;
+    uint64_t interval;
+};
+
+void exchange_tcp(int fd, const Config &config, uint64_t sequence,
+                  const std::vector<uint8_t> &pattern, MessageBuffers &buffers,
+                  const MessageTiming &timing) {
+    const auto header = encode({config.payload, sequence, 0, 1});
+    std::copy(header.begin(), header.end(), buffers.request.begin());
+
+    if (config.write == "coalesced") {
+        send_all(fd, buffers.request.data(), buffers.request.size(), timing.deadline);
+    } else {
+        send_all(fd, buffers.request.data(), header_size, timing.deadline);
+        send_all(fd, buffers.request.data() + header_size, config.payload, timing.deadline);
+    }
+
+    recv_exact(fd, buffers.response.data(), buffers.response.size(), timing.deadline);
+    const auto echo = decode(buffers.response, false);
+    if (echo.payload != config.payload || echo.sequence != sequence ||
+        !std::equal(pattern.begin(), pattern.end(), buffers.response.begin() + header_size)) {
+        throw Error("TCP echo integrity mismatch");
+    }
+}
+
+void exchange_udp(int fd, const Config &config, uint64_t sequence,
+                  const std::vector<uint8_t> &pattern, MessageBuffers &buffers,
+                  const MessageTiming &timing, Stats &stats) {
+    const uint32_t fragments = fragment_count(config.payload);
+    SequenceTracker tracker(fragments);
+
+    for (uint32_t fragment = 0; fragment < fragments; ++fragment) {
+        const Header request{config.payload, sequence, fragment, fragments};
+        const auto header = encode(request);
+        const size_t payload_size = fragment_size(request);
+        std::copy(header.begin(), header.end(), buffers.request.begin());
+        std::copy_n(pattern.data() + fragment * udp_chunk, payload_size,
+                    buffers.request.data() + header_size);
+        send_datagram(fd, buffers.request.data(), header_size + payload_size, timing.deadline);
+        ++stats.datagrams_sent;
+
+        while (!stopped) {
+            const size_t received = recv_datagram(fd, buffers.response.data(),
+                                                  buffers.response.size(), timing.deadline);
+            const auto echo = decode(std::span(buffers.response.data(), received), true);
+            if (echo.sequence != sequence) {
+                ++stats.late;
+                continue;
+            }
+            if (echo.fragment > fragment)
+                throw Error("echo references unsent fragment");
+            if (echo.payload != config.payload || received != header_size + fragment_size(echo) ||
+                !std::equal(buffers.response.begin() + header_size,
+                            buffers.response.begin() + static_cast<ptrdiff_t>(received),
+                            pattern.begin() + echo.fragment * udp_chunk)) {
+                throw Error("UDP echo integrity mismatch");
+            }
+            if (tracker.observe(echo.fragment))
+                ++stats.datagrams_received;
+            else
+                ++stats.duplicates;
+            if (echo.fragment == fragment)
+                break;
         }
-        uint64_t end = start + static_cast<uint64_t>(c.duration * 1e9);
-        double per_second = std::min(static_cast<double>(c.rate) / c.clients,
-                                     c.mbps * 1e6 / 8 / c.payload / c.clients);
-        uint64_t interval = static_cast<uint64_t>(1e9 / per_second), next = start;
-        for (uint64_t seq = 0; seq < c.messages && !stopped; ++seq) {
+
+        // Fragment pacing is part of logical RTT and must share its deadline.
+        if (fragment + 1 < fragments) {
+            const auto next = timing.start + timing.interval * (fragment + 1) / fragments;
+            pace_until(std::min(timing.deadline, next));
+        }
+    }
+    stats.reordered += tracker.reordered();
+    if (tracker.missing())
+        throw Timeout("incomplete UDP logical message");
+}
+
+void run_worker(const Config &config, Stats &stats, std::barrier<> &ready, const uint64_t &start) {
+    Fd socket;
+    try {
+        socket = make_socket(config, config.io == "nonblocking");
+        connect_socket(socket.get(), config,
+                       now_ns() + static_cast<uint64_t>(config.timeout_ms) * 1000000);
+        stats.sndbuf = socket_buffer(socket.get(), SO_SNDBUF);
+        stats.rcvbuf = socket_buffer(socket.get(), SO_RCVBUF);
+    } catch (const std::exception &error) {
+        ++stats.errors;
+        stats.error = error.what();
+    }
+
+    // All connections finish setup before main publishes a common start time.
+    ready.arrive_and_wait();
+    ready.arrive_and_wait();
+    if (stats.errors)
+        return;
+
+    try {
+        const auto pattern = payload_pattern(config.payload);
+        const auto buffer_size =
+            header_size + (config.protocol == "tcp" ? config.payload : udp_chunk);
+        MessageBuffers reusable;
+        if (config.buffering == "reuse") {
+            reusable.resize(buffer_size);
+            if (config.protocol == "tcp")
+                std::copy(pattern.begin(), pattern.end(), reusable.request.begin() + header_size);
+        }
+
+        const uint64_t end = start + static_cast<uint64_t>(config.duration * 1e9);
+        const double requests_per_second =
+            std::min(static_cast<double>(config.rate) / config.clients,
+                     config.mbps * 1e6 / 8 / config.payload / config.clients);
+        const uint64_t interval = static_cast<uint64_t>(1e9 / requests_per_second);
+        uint64_t next = start;
+
+        for (uint64_t sequence = 0; sequence < config.messages && !stopped; ++sequence) {
             if (now_ns() >= end)
                 break;
             if (next >= end) {
@@ -44,131 +144,95 @@ void run(const Config &c, Stats &s, std::barrier<> &ready, uint64_t &start) {
             pace_until(next);
             if (stopped || now_ns() >= end)
                 break;
-            ++s.attempted;
-            uint64_t began = now_ns();
-            uint64_t deadline = began + static_cast<uint64_t>(c.timeout_ms) * 1000000;
+
+            ++stats.attempted;
+            const uint64_t began = now_ns();
+            const MessageTiming timing{
+                began, began + static_cast<uint64_t>(config.timeout_ms) * 1000000, interval};
             try {
-                if (c.protocol == "tcp") {
-                    auto header = encode({c.payload, seq, 0, 1});
-                    std::vector<uint8_t> allocated_send, allocated_echo;
-                    if (c.buffering == "allocate") {
-                        allocated_send.resize(header_size + c.payload);
-                        allocated_echo.resize(header_size + c.payload);
+                MessageBuffers allocated;
+                if (config.buffering == "allocate") {
+                    allocated.resize(buffer_size);
+                    if (config.protocol == "tcp") {
                         std::copy(pattern.begin(), pattern.end(),
-                                  allocated_send.begin() + header_size);
+                                  allocated.request.begin() + header_size);
                     }
-                    auto &packet = c.buffering == "reuse" ? reusable_send : allocated_send;
-                    auto &echo = c.buffering == "reuse" ? reusable_echo : allocated_echo;
-                    std::copy(header.begin(), header.end(), packet.begin());
-                    if (c.write == "coalesced")
-                        send_all(sock.get(), packet.data(), packet.size(), deadline);
-                    else {
-                        send_all(sock.get(), packet.data(), header_size, deadline);
-                        send_all(sock.get(), packet.data() + header_size, c.payload, deadline);
-                    }
-                    recv_exact(sock.get(), echo.data(), echo.size(), deadline);
-                    auto h = decode(echo, false);
-                    if (h.payload != c.payload || h.sequence != seq ||
-                        !std::equal(pattern.begin(), pattern.end(), echo.begin() + header_size))
-                        throw Error("TCP echo integrity mismatch");
-                } else {
-                    uint32_t fragments = fragment_count(c.payload);
-                    SequenceTracker tracker(fragments);
-                    std::vector<uint8_t> allocated_send, allocated_echo;
-                    if (c.buffering == "allocate") {
-                        allocated_send.resize(header_size + udp_chunk);
-                        allocated_echo.resize(header_size + udp_chunk);
-                    }
-                    auto &packet = c.buffering == "reuse" ? reusable_send : allocated_send;
-                    auto &echo = c.buffering == "reuse" ? reusable_echo : allocated_echo;
-                    for (uint32_t f = 0; f < fragments; ++f) {
-                        Header h{c.payload, seq, f, fragments};
-                        auto header = encode(h);
-                        size_t n = fragment_size(h);
-                        std::copy(header.begin(), header.end(), packet.begin());
-                        std::copy_n(pattern.data() + f * udp_chunk, n, packet.data() + header_size);
-                        send_datagram(sock.get(), packet.data(), header_size + n, deadline);
-                        ++s.datagrams_sent;
-                        while (!stopped) {
-                            size_t size =
-                                recv_datagram(sock.get(), echo.data(), echo.size(), deadline);
-                            auto r = decode(std::span(echo.data(), size), true);
-                            if (r.sequence != seq) {
-                                ++s.late;
-                                continue;
-                            }
-                            if (r.fragment > f)
-                                throw Error("echo references unsent fragment");
-                            if (r.payload != c.payload || size != header_size + fragment_size(r) ||
-                                !std::equal(echo.begin() + header_size,
-                                            echo.begin() + static_cast<ptrdiff_t>(size),
-                                            pattern.begin() + r.fragment * udp_chunk))
-                                throw Error("UDP echo integrity mismatch");
-                            if (tracker.observe(r.fragment))
-                                ++s.datagrams_received;
-                            else
-                                ++s.duplicates;
-                            if (r.fragment == f)
-                                break;
-                        }
-                        // Charge pacing to the logical RTT: UDP fragments are sent in stop-and-wait
-                        // order.
-                        if (f + 1 < fragments)
-                            pace_until(began + interval * (f + 1) / fragments);
-                    }
-                    s.reordered += tracker.reordered();
-                    if (tracker.missing())
-                        throw Timeout("incomplete UDP logical message");
                 }
-                ++s.completed;
-                s.rtt_us.push_back(static_cast<double>(now_ns() - began) / 1e3);
+                auto &buffers = config.buffering == "reuse" ? reusable : allocated;
+                if (config.protocol == "tcp")
+                    exchange_tcp(socket.get(), config, sequence, pattern, buffers, timing);
+                else
+                    exchange_udp(socket.get(), config, sequence, pattern, buffers, timing, stats);
+
+                ++stats.completed;
+                stats.rtt_us.push_back(static_cast<double>(now_ns() - began) / 1e3);
             } catch (const Timeout &) {
-                ++s.timeouts;
-                if (c.protocol == "tcp")
-                    break; // Cannot resume a stream with unknown framing position.
+                ++stats.timeouts;
+                if (config.protocol == "tcp")
+                    break; // A partially consumed stream cannot safely resume at the next frame.
             }
-            // No catch-up bursts after a stall; sleep time is excluded from successful RTTs.
+            // Advance from the actual start to avoid catch-up bursts after a stall.
             next = std::max(next + interval, began + interval);
         }
-    } catch (const std::exception &e) {
+    } catch (const std::exception &error) {
         if (!stopped) {
-            ++s.errors;
-            s.error = e.what();
+            ++stats.errors;
+            stats.error = error.what();
         }
     }
 }
 } // namespace
+
 int main(int argc, char **argv) {
     try {
         install_signals();
-        auto c = parse(argc, argv, false);
-        if (c.format == "csv")
+        const auto config = parse(argc, argv, false);
+        if (config.format == "csv")
             std::cout << csv_header() << '\n';
         bool failed = false;
-        for (uint32_t it = 0; it < c.iterations && !stopped; ++it) {
-            std::vector<Stats> stats(c.clients);
+        for (uint32_t iteration = 0; iteration < config.iterations && !stopped; ++iteration) {
+            std::vector<Stats> stats(config.clients);
             std::vector<std::thread> threads;
-            std::barrier ready(static_cast<ptrdiff_t>(c.clients + 1));
+            threads.reserve(config.clients);
+            std::barrier ready(static_cast<ptrdiff_t>(config.clients + 1));
             uint64_t start = 0;
-            for (uint32_t n = 0; n < c.clients; ++n)
-                threads.emplace_back([&, n] { run(c, stats[n], ready, start); });
+            try {
+                for (uint32_t worker = 0; worker < config.clients; ++worker) {
+                    threads.emplace_back(
+                        [&, worker] { run_worker(config, stats[worker], ready, start); });
+                }
+            } catch (const std::exception &error) {
+                // Release existing workers even when the OS refuses another thread.
+                for (size_t worker = threads.size(); worker < stats.size(); ++worker) {
+                    ++stats[worker].errors;
+                    stats[worker].error = error.what();
+                    ready.arrive_and_drop();
+                }
+            }
             ready.arrive_and_wait();
             start = now_ns();
             double cpu = cpu_seconds();
             ready.arrive_and_wait();
-            for (auto &t : threads)
-                t.join();
-            double sec = static_cast<double>(now_ns() - start) / 1e9;
+            for (auto &thread : threads)
+                thread.join();
+
+            const double seconds = static_cast<double>(now_ns() - start) / 1e9;
             cpu = cpu_seconds() - cpu;
-            std::cout << (c.format == "json" ? result_json(c, it, stats, sec, cpu)
-                                             : result_csv(c, it, stats, sec, cpu))
-                      << std::endl;
-            for (const auto &s : stats)
-                failed = failed || s.errors || s.timeouts;
+            std::cout << (config.format == "json"
+                              ? result_json(config, iteration, stats, seconds, cpu)
+                              : result_csv(config, iteration, stats, seconds, cpu))
+                      << '\n'
+                      << std::flush;
+            uint64_t completed = 0;
+            for (const auto &worker : stats) {
+                failed = failed || worker.errors || worker.timeouts;
+                completed += worker.completed;
+            }
+            failed = failed || !completed;
         }
         return stopped ? 130 : failed ? 2 : 0;
-    } catch (const std::exception &e) {
-        std::cerr << "client: " << e.what() << '\n';
+    } catch (const std::exception &error) {
+        std::cerr << "client: " << error.what() << '\n';
         return 1;
     }
 }

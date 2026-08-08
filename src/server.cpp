@@ -1,27 +1,33 @@
 #include "netbench/common.hpp"
 #include "netbench/protocol.hpp"
+#include <algorithm>
 #include <array>
+#include <cerrno>
+#include <condition_variable>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <poll.h>
 #include <thread>
 using namespace nb;
 namespace {
 struct Worker {
+    // Stable allocation survives vector moves; thread is destroyed/joined first.
+    std::unique_ptr<std::atomic<bool>> done;
     std::jthread thread;
-    std::shared_ptr<std::atomic<bool>> done;
 };
 void serve_tcp(Fd fd, const Config &c, std::atomic<uint64_t> &frames,
                std::atomic<uint64_t> &errors) {
+    bool in_frame = false;
     try {
         std::vector<uint8_t> frame;
         while (!stopped) {
-            uint64_t deadline = now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000;
             std::array<uint8_t, header_size> header{};
             recv_exact(fd.get(), header.data(), 1,
                        now_ns() + static_cast<uint64_t>((c.duration + 1) * 1e9));
-            deadline = now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000;
+            in_frame = true;
+            const uint64_t deadline = now_ns() + static_cast<uint64_t>(c.timeout_ms) * 1000000;
             recv_exact(fd.get(), header.data() + 1, header.size() - 1, deadline);
             auto h = decode(header, false);
             if (c.buffering == "allocate")
@@ -32,11 +38,14 @@ void serve_tcp(Fd fd, const Config &c, std::atomic<uint64_t> &frames,
             recv_exact(fd.get(), frame.data() + header_size, h.payload, deadline);
             send_all(fd.get(), frame.data(), frame.size(), deadline);
             ++frames;
+            in_frame = false;
         }
-    } catch (const Closed &e) {
-        if (std::string(e.what()) != "peer closed")
+    } catch (const Closed &) {
+        if (in_frame && !stopped)
             ++errors;
-    } catch (const Timeout &) { /* Idle or stalled peer is closed at the bounded deadline. */
+    } catch (const Timeout &) {
+        if (in_frame && !stopped)
+            ++errors;
     } catch (const std::exception &) {
         if (!stopped)
             ++errors;
@@ -55,11 +64,18 @@ int main(int argc, char **argv) {
             syscheck(listen(sock.get(), 32) == 0, "listen");
         std::cout << "{\"event\":\"ready\",\"port\":" << local_port(sock.get())
                   << ",\"sndbuf_effective\":" << socket_buffer(sock.get(), SO_SNDBUF)
-                  << ",\"rcvbuf_effective\":" << socket_buffer(sock.get(), SO_RCVBUF) << "}"
-                  << std::endl;
+                  << ",\"rcvbuf_effective\":" << socket_buffer(sock.get(), SO_RCVBUF) << "}\n"
+                  << std::flush; // The runner needs readiness before the accept loop blocks.
         std::atomic<uint64_t> frames{0}, errors{0};
-        uint64_t accepted = 0, rejected = 0;
+        uint64_t accepted = 0;
+        size_t peak_workers = 0;
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
         std::vector<Worker> workers;
+        workers.reserve(c.clients);
+        struct ShutdownWorkers {
+            ~ShutdownWorkers() { stopped = true; }
+        } shutdown_workers;
         auto end = start + static_cast<uint64_t>(c.duration * 1e9);
         std::array<uint8_t, header_size + udp_chunk> packet{};
         while (!stopped && now_ns() < end) {
@@ -69,6 +85,16 @@ int main(int argc, char **argv) {
                     i = workers.erase(i);
                 } else
                     ++i;
+            }
+            if (c.protocol == "tcp" && workers.size() >= c.clients) {
+                // Do not reject a reconnect merely because its previous worker has not
+                // observed FIN yet. The finite listen backlog holds new connections.
+                std::unique_lock lock(done_mutex);
+                done_cv.wait_for(lock, std::chrono::milliseconds(50), [&] {
+                    return stopped || std::any_of(workers.begin(), workers.end(),
+                                                  [](const auto &w) { return w.done->load(); });
+                });
+                continue;
             }
             try {
                 wait_ready(sock.get(), POLLIN, std::min(end, now_ns() + 50000000));
@@ -82,21 +108,23 @@ int main(int argc, char **argv) {
             if (c.protocol == "tcp") {
                 Fd client(accept4(sock.get(), nullptr, nullptr, SOCK_CLOEXEC));
                 if (client.get() < 0) {
-                    if (errno == EINTR || errno == EAGAIN)
+                    if (errno == EINTR || errno == EAGAIN || errno == ECONNABORTED)
                         continue;
                     syscheck(false, "accept");
                 }
-                if (workers.size() >= c.clients) {
-                    ++rejected;
-                    continue;
-                }
                 configure(client.get(), c, c.io == "nonblocking");
-                auto done = std::make_shared<std::atomic<bool>>(false);
-                std::jthread thread([fd = std::move(client), &c, &frames, &errors, done]() mutable {
+                auto done = std::make_unique<std::atomic<bool>>(false);
+                std::jthread thread([fd = std::move(client), &c, &frames, &errors,
+                                     done_ptr = done.get(), &done_mutex, &done_cv]() mutable {
                     serve_tcp(std::move(fd), c, frames, errors);
-                    done->store(true);
+                    {
+                        std::lock_guard lock(done_mutex);
+                        done_ptr->store(true);
+                    }
+                    done_cv.notify_one();
                 });
-                workers.push_back({std::move(thread), done});
+                workers.push_back({std::move(done), std::move(thread)});
+                peak_workers = std::max(peak_workers, workers.size());
                 ++accepted;
             } else {
                 sockaddr_in peer{};
@@ -122,10 +150,9 @@ int main(int argc, char **argv) {
             worker.thread.join();
         std::cout << "{\"event\":\"summary\",\"frames_echoed\":" << frames.load()
                   << ",\"errors\":" << errors.load() << ",\"accepted_connections\":" << accepted
-                  << ",\"rejected_connections\":" << rejected
-                  << ",\"cpu_s\":" << cpu_seconds() - cpu
+                  << ",\"peak_workers\":" << peak_workers << ",\"cpu_s\":" << cpu_seconds() - cpu
                   << ",\"lifetime_s\":" << static_cast<double>(now_ns() - start) / 1e9 << "}"
-                  << std::endl;
+                  << '\n';
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "server: " << e.what() << '\n';
