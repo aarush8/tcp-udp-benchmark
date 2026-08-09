@@ -1,3 +1,49 @@
+# CMake builds and local compilation databases.
 /build*/
+/CMakeFiles/
+/CMakeCache.txt
+/CMakeUserPresets.json
+/Testing/
+/cmake_install.cmake
+/compile_commands.json
+
+# Python environments, bytecode, tooling caches, and coverage.
+/.venv/
+/venv/
 __pycache__/
-.venv/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Editor and operating-system files.
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Keep curated evidence; new local campaigns and validation logs stay local.
+/results/*
+!/results/README.md
+!/results/baseline/
+!/results/comparison/
+!/results/survey/
+!/results/confirmation/
+!/results/diagnostics/
+!/results/plots/
+
+# Recreated from the retained JSONL records by the runner/analyzer.
+/results/*/trials.csv
+/results/plots/*.svg
+/results/plots/summary.json
+/results/plots/summary.csv
